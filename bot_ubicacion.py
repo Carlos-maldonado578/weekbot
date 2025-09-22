@@ -30,6 +30,9 @@ if not CHAT_ID_TUYO or not CHAT_ID_ESPOSA:
 AUTHORIZED_USERS = [CHAT_ID_TUYO, CHAT_ID_ESPOSA]
 bot_application = None
 
+# Configuración de ubicación en tiempo real
+LIVE_LOCATION_DURATION = 7200  # 2 horas en segundos (máximo recomendado)
+
 # Logging
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -44,6 +47,8 @@ class LocationBot:
         self.application = Application.builder().token(token).build()
         bot_application = self.application
         self.pending_requests = {}
+        # Para rastrear mensajes de ubicación en tiempo real
+        self.live_location_messages = {}
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -53,10 +58,12 @@ class LocationBot:
         self.application.add_handler(
             CommandHandler("test", self.test_automation))
         self.application.add_handler(CommandHandler("status", self.status))
-        self.application.add_handler(CommandHandler(
-            "time", self.show_time))
+        self.application.add_handler(CommandHandler("time", self.show_time))
+        # Manejar tanto ubicaciones nuevas como editadas (para tiempo real)
         self.application.add_handler(MessageHandler(
             filters.LOCATION, self.handle_location))
+        self.application.add_handler(MessageHandler(
+            filters.LOCATION, self.handle_edited_location))
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando para verificar el estado del bot"""
@@ -71,7 +78,10 @@ class LocationBot:
         status_msg += f"📅 Automatización:\n"
         status_msg += f"• 6:30 AM (Mar-Jue): Solo esposa\n"
         status_msg += f"• 6:15 PM (Mar-Jue): Ambos\n\n"
-        status_msg += f"📍 Tipo: Ubicación en tiempo real (2 horas)\n"
+        status_msg += f"📍 Funcionalidad:\n"
+        status_msg += f"• Convierte ubicaciones a tiempo real automáticamente\n"
+        status_msg += f"• Duración: {LIVE_LOCATION_DURATION // 3600}h\n"
+        status_msg += f"• Recibe actualizaciones en tiempo real\n\n"
         status_msg += f"👥 Usuarios autorizados: {len([x for x in AUTHORIZED_USERS if x])}\n"
         status_msg += f"✅ Bot funcionando correctamente"
 
@@ -85,17 +95,19 @@ class LocationBot:
         user_name = update.effective_user.first_name or "Usuario"
         user_role = "Esposo" if user_id == CHAT_ID_TUYO else "Esposa"
 
-        # Crear teclado con botón para ubicación en tiempo real
         keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton(
-                "📍 Compartir Ubicación en Tiempo Real", request_location=True)]
+            [KeyboardButton("📍 Compartir Ubicación", request_location=True)]
         ], resize_keyboard=True)
 
         await update.message.reply_text(
             f"Hola {user_name}!\n\n"
             f"Rol: {user_role}\n\n"
-            f"📍 Este bot comparte ubicación en TIEMPO REAL por 2 horas\n\n"
-            f"Automatización:\n"
+            f"🔄 **Funcionalidad de Ubicación en Tiempo Real:**\n"
+            f"• Envía tu ubicación normal\n"
+            f"• El bot la convierte automáticamente a tiempo real\n"
+            f"• Duración: {LIVE_LOCATION_DURATION // 3600} horas\n"
+            f"• Se actualiza automáticamente si compartes ubicación en vivo\n\n"
+            f"📅 Automatización:\n"
             f"• 6:30 AM (Mar-Jue): Solo esposa\n"
             f"• 6:15 PM (Mar-Jue): Ambos\n\n"
             f"Comandos:\n"
@@ -122,8 +134,8 @@ class LocationBot:
             'time': datetime.now(CHILE_TZ)
         }
 
-        await self.send_live_location_request(target_id, f"Tu {target_name} ({requester_name}) solicita tu ubicación en tiempo real")
-        await update.message.reply_text(f"Solicitud de ubicación en tiempo real enviada a tu {target_name}")
+        await self.send_location_request(target_id, f"Tu {target_name} ({requester_name}) solicita tu ubicación")
+        await update.message.reply_text(f"Solicitud enviada a tu {target_name}")
 
     async def test_automation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
@@ -141,6 +153,7 @@ class LocationBot:
         await update.message.reply_text("Prueba completada")
 
     async def handle_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Maneja ubicaciones normales y las convierte a tiempo real"""
         if not update.message or not update.message.location:
             return
 
@@ -158,86 +171,138 @@ class LocationBot:
             if not recipient_id:
                 return
 
-            sender_role = "esposo" if user_id == CHAT_ID_TUYO else "esposa"
             current_time = datetime.now(CHILE_TZ).strftime("%H:%M")
 
-            live_period = getattr(location, 'live_period', None)
+            # Si la ubicación YA tiene live_period, mantenerla
+            if hasattr(location, 'live_period') and location.live_period and location.live_period > 0:
+                logger.info(
+                    f"Ubicación en tiempo real recibida de {user_name} (duración: {location.live_period}s)")
 
-            if live_period and live_period > 0:
-                # Ubicación en tiempo real recibida
-                await context.bot.send_location(
+                # Reenviar ubicación en tiempo real tal como viene
+                sent_message = await context.bot.send_location(
                     chat_id=recipient_id,
                     latitude=location.latitude,
                     longitude=location.longitude,
-                    live_period=live_period
+                    live_period=location.live_period
                 )
 
-                duration_hours = live_period // 3600
-                duration_minutes = (live_period % 3600) // 60
+                # Guardar referencia del mensaje para actualizaciones futuras
+                self.live_location_messages[f"{user_id}_{recipient_id}"] = sent_message.message_id
+
+                duration_hours = location.live_period // 3600
+                duration_minutes = (location.live_period % 3600) // 60
 
                 await context.bot.send_message(
                     chat_id=recipient_id,
-                    text=f"📍 Ubicación en Tiempo Real\n\n"
+                    text=f"🔄 Ubicación en Tiempo Real Activa\n\n"
                     f"De: {user_name}\n"
                     f"Hora: {current_time}\n"
-                    f"Duración: {duration_hours}h {duration_minutes}m\n\n"
-                    f"🔄 Se actualizará automáticamente"
+                    f"Duración: {duration_hours}h {duration_minutes}m\n"
+                    f"📍 Se actualiza automáticamente"
                 )
 
                 await update.message.reply_text(
-                    f"✅ Ubicación en tiempo real compartida con tu {recipient_role}\n"
+                    f"✅ Tu ubicación en tiempo real se compartió con tu {recipient_role}\n"
                     f"⏰ Duración: {duration_hours}h {duration_minutes}m\n"
                     f"🔄 Se actualizará automáticamente"
                 )
 
-                logger.info(
-                    f"Ubicación en tiempo real enviada: {user_name} -> {recipient_role} ({duration_hours}h {duration_minutes}m)")
             else:
-                # Si por alguna razón llega ubicación normal, convertirla a tiempo real
-                # Enviar como ubicación en tiempo real por 2 horas por defecto
-                await context.bot.send_location(
+                # Ubicación normal - convertir a tiempo real
+                logger.info(
+                    f"Convirtiendo ubicación normal de {user_name} a tiempo real")
+
+                sent_message = await context.bot.send_location(
                     chat_id=recipient_id,
                     latitude=location.latitude,
                     longitude=location.longitude,
-                    live_period=7200  # 2 horas en segundos
+                    live_period=LIVE_LOCATION_DURATION  # Convertir a tiempo real
                 )
+
+                # Guardar referencia del mensaje
+                self.live_location_messages[f"{user_id}_{recipient_id}"] = sent_message.message_id
 
                 await context.bot.send_message(
                     chat_id=recipient_id,
-                    text=f"📍 Ubicación en Tiempo Real\n\n"
+                    text=f"📍 Ubicación Convertida a Tiempo Real\n\n"
                     f"De: {user_name}\n"
                     f"Hora: {current_time}\n"
-                    f"Duración: 2h 0m\n\n"
-                    f"🔄 Se actualizará automáticamente"
+                    f"Duración: {LIVE_LOCATION_DURATION // 3600}h\n"
+                    f"🔄 El bot la convirtió automáticamente"
                 )
 
                 await update.message.reply_text(
-                    f"✅ Ubicación convertida a tiempo real y enviada a tu {recipient_role}\n"
-                    f"⏰ Duración: 2h 0m\n"
-                    f"🔄 Se actualizará automáticamente"
+                    f"✅ Tu ubicación se convirtió a tiempo real y se envió a tu {recipient_role}\n"
+                    f"⏰ Duración: {LIVE_LOCATION_DURATION // 3600}h\n"
+                    f"💡 Para mejores actualizaciones, comparte 'Ubicación en tiempo real' desde Telegram"
                 )
 
-                logger.info(
-                    f"Ubicación convertida a tiempo real: {user_name} -> {recipient_role} (2h)")
+            logger.info(
+                f"Ubicación procesada exitosamente: {user_name} -> {recipient_role}")
 
         except Exception as e:
-            logger.error(f"Error enviando ubicación: {e}")
-            await update.message.reply_text("❌ Error al enviar ubicación en tiempo real")
+            logger.error(f"Error procesando ubicación: {e}")
+            await update.message.reply_text("❌ Error al procesar ubicación")
 
-    async def send_live_location_request(self, chat_id, message):
-        """Solicita específicamente ubicación en tiempo real"""
+    async def handle_edited_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Maneja actualizaciones de ubicación en tiempo real"""
+        # Este método se ejecuta cuando una ubicación en tiempo real se actualiza
+        if not update.edited_message or not update.edited_message.location:
+            return
+
+        try:
+            user_id = str(update.effective_user.id)
+            user_name = update.effective_user.first_name or "Usuario"
+            location = update.edited_message.location
+
+            logger.info(
+                f"Actualización de ubicación en tiempo real recibida de {user_name}")
+
+            recipient_id, recipient_role = self.get_target_user(user_id)
+            if not recipient_id:
+                return
+
+            # Buscar mensaje de ubicación en tiempo real correspondiente
+            message_key = f"{user_id}_{recipient_id}"
+            if message_key in self.live_location_messages:
+                message_id = self.live_location_messages[message_key]
+
+                try:
+                    # Actualizar la ubicación en tiempo real
+                    await context.bot.edit_message_live_location(
+                        chat_id=recipient_id,
+                        message_id=message_id,
+                        latitude=location.latitude,
+                        longitude=location.longitude
+                    )
+
+                    logger.info(
+                        f"Ubicación en tiempo real actualizada: {user_name} -> {recipient_role}")
+
+                except Exception as edit_error:
+                    logger.warning(
+                        f"No se pudo actualizar ubicación en tiempo real: {edit_error}")
+                    # Si no se puede editar, enviar nueva ubicación
+                    await context.bot.send_location(
+                        chat_id=recipient_id,
+                        latitude=location.latitude,
+                        longitude=location.longitude,
+                        live_period=LIVE_LOCATION_DURATION
+                    )
+
+        except Exception as e:
+            logger.error(f"Error manejando actualización de ubicación: {e}")
+
+    async def send_location_request(self, chat_id, message):
         keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton(
-                "📍 Compartir Ubicación en Tiempo Real", request_location=True)]
+            [KeyboardButton("📍 Compartir Ubicación", request_location=True)]
         ], resize_keyboard=True, one_time_keyboard=True)
 
         full_message = f"{message}\n\n"
-        full_message += f"🔄 Por favor, comparte tu ubicación EN TIEMPO REAL\n"
-        full_message += f"⏰ Duración recomendada: 2 horas\n\n"
-        full_message += f"📱 Instrucciones:\n"
-        full_message += f"1. Presiona el botón de abajo\n"
-        full_message += f"2. Selecciona 'Ubicación en tiempo real'\n"
-        full_message += f"3. Elige duración (recomendado: 2h)"
+        full_message += f"📍 **Opciones de Ubicación:**\n"
+        full_message += f"• Ubicación normal: El bot la convierte a tiempo real automáticamente\n"
+        full_message += f"• Ubicación en tiempo real: Se mantiene y actualiza automáticamente\n\n"
+        full_message += f"💡 **Recomendación:** Para mejor precisión, usa 'Ubicación en tiempo real' desde Telegram"
 
         await self.application.bot.send_message(
             chat_id=chat_id,
@@ -245,44 +310,42 @@ class LocationBot:
             reply_markup=keyboard
         )
 
-    # Método para compatibilidad con código existente
-    async def send_location_request(self, chat_id, message):
-        """Alias para send_live_location_request - mantiene compatibilidad"""
-        await self.send_live_location_request(chat_id, message)
-
     async def automatic_request_both(self, test_mode=False):
         current_time = datetime.now(CHILE_TZ).strftime("%H:%M")
         prefix = "[PRUEBA] " if test_mode else ""
 
-        message = f"{prefix}📍 Ubicación Automática Vespertina\n\nHora: {current_time}\nComparte tu ubicación en TIEMPO REAL para coordinar el regreso"
+        message = f"{prefix}📍 Ubicación Automática Vespertina\n\nHora: {current_time}\nComparte tu ubicación para coordinar el regreso"
 
         if CHAT_ID_TUYO:
-            await self.send_live_location_request(CHAT_ID_TUYO, message)
+            await self.send_location_request(CHAT_ID_TUYO, message)
         if CHAT_ID_ESPOSA:
-            await self.send_live_location_request(CHAT_ID_ESPOSA, message)
+            await self.send_location_request(CHAT_ID_ESPOSA, message)
 
-        logger.info(
-            f"Solicitudes vespertinas de ubicación en tiempo real enviadas - {current_time}")
+        logger.info(f"Solicitudes vespertinas enviadas - {current_time}")
 
     async def automatic_request_spouse_only(self, test_mode=False):
         current_time = datetime.now(CHILE_TZ).strftime("%H:%M")
         prefix = "[PRUEBA] " if test_mode else ""
 
-        message = f"{prefix}📍 Ubicación Automática Matutina\n\nHora: {current_time}\nComparte tu ubicación en TIEMPO REAL para el trayecto al trabajo"
+        message = f"{prefix}📍 Ubicación Automática Matutina\n\nHora: {current_time}\nComparte tu ubicación para el trayecto al trabajo"
 
         if CHAT_ID_ESPOSA:
-            await self.send_live_location_request(CHAT_ID_ESPOSA, message)
-            logger.info(
-                f"Solicitud matutina de ubicación en tiempo real enviada - {current_time}")
+            await self.send_location_request(CHAT_ID_ESPOSA, message)
+            logger.info(f"Solicitud matutina enviada - {current_time}")
 
     async def check_auth(self, update: Update) -> bool:
-        if not update.message:
+        if not update.message and not update.edited_message:
             return False
 
-        user_id = str(update.effective_user.id)
+        # Obtener user_id de mensaje normal o editado
+        if update.message:
+            user_id = str(update.message.from_user.id)
+        else:
+            user_id = str(update.edited_message.from_user.id)
 
         if user_id not in AUTHORIZED_USERS:
-            await update.message.reply_text("❌ No autorizado")
+            if update.message:
+                await update.message.reply_text("❌ No autorizado")
             return False
 
         return True
@@ -313,7 +376,9 @@ class LocationBot:
         msg += f"📅 **Automatización:**\n"
         msg += f"• Mañana: 06:30 Chile = {morning_utc:02d}:30 UTC\n"
         msg += f"• Tarde: 18:15 Chile = {evening_utc:02d}:15 UTC\n\n"
-        msg += f"📍 Tipo: Ubicación en tiempo real (2 horas)\n"
+        msg += f"📍 **Ubicación en Tiempo Real:**\n"
+        msg += f"• Duración automática: {LIVE_LOCATION_DURATION // 3600}h\n"
+        msg += f"• Actualización: Automática\n"
         msg += f"📆 Días: Martes, Miércoles, Jueves"
 
         await update.message.reply_text(msg)
@@ -339,6 +404,7 @@ async def run_morning():
             bot_instance = LocationBot.__new__(LocationBot)
             bot_instance.application = bot_application
             bot_instance.pending_requests = {}
+            bot_instance.live_location_messages = {}
             await bot_instance.automatic_request_spouse_only()
         except Exception as e:
             logger.error(f"Error matutino: {e}")
@@ -350,6 +416,7 @@ async def run_evening():
             bot_instance = LocationBot.__new__(LocationBot)
             bot_instance.application = bot_application
             bot_instance.pending_requests = {}
+            bot_instance.live_location_messages = {}
             await bot_instance.automatic_request_both()
         except Exception as e:
             logger.error(f"Error vespertino: {e}")
@@ -405,7 +472,8 @@ def schedule_jobs():
         f"Trabajos programados (UTC): {morning_utc_hour:02d}:30 y {evening_utc_hour:02d}:15")
     logger.info(f"Equivale en Chile: 06:30 y 18:15")
     logger.info(f"Offset Chile-UTC: {offset_hours} horas")
-    logger.info(f"Tipo de ubicación: Tiempo real (2 horas)")
+    logger.info(
+        f"Duración ubicación tiempo real: {LIVE_LOCATION_DURATION // 3600}h")
 
 
 def run_scheduler():
@@ -423,6 +491,8 @@ def main():
     logger.info(f"BOT_TOKEN configurado: {'Sí' if BOT_TOKEN else 'No'}")
     logger.info(
         f"Usuarios configurados: {len([x for x in AUTHORIZED_USERS if x])}")
+    logger.info(
+        f"Duración ubicación tiempo real: {LIVE_LOCATION_DURATION // 3600}h")
 
     try:
         bot = LocationBot(BOT_TOKEN)
